@@ -1,0 +1,194 @@
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+
+#define SCREEN_WIDTH 128 // OLED display width, in pixels
+#define SCREEN_HEIGHT 64 // OLED display height, in pixels
+#define OLED_RESET -1 // Reset pin # (or -1 if sharing Arduino reset pin)
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
+
+const byte OC1A_PIN = 9; // PWM for both fans
+const byte OC1B_PIN = 10; // Unused
+const byte TACH1_PIN = 2; // Tachometer for Fan 1
+const byte TACH2_PIN = 3; // Tachometer for Fan 2
+const byte BUTTON_A_PIN = 6; // Button A: Set speed to 0% (moved from pin 3)
+const byte BUTTON_B_PIN = 4; // Button B: Decrease speed by 5%
+const byte BUTTON_C_PIN = 5; // Button C: Increase speed by 5%
+
+const word PWM_FREQ_HZ = 25000; // 25 kHz PWM frequency
+const word TCNT1_TOP = 16000000 / (2 * PWM_FREQ_HZ * 1); // Prescaler = 1
+
+volatile unsigned long pulseCount1 = 0; // Count tachometer pulses for Fan 1
+volatile unsigned long pulseCount2 = 0; // Count tachometer pulses for Fan 2
+unsigned long lastRpmTime = 0;
+byte currentDuty = 0; // Track current duty cycle, start at 0%
+
+// Debounce variables
+unsigned long lastDebounceTimeA = 0;
+unsigned long lastDebounceTimeB = 0;
+unsigned long lastDebounceTimeC = 0;
+const unsigned long debounceDelay = 50; // Debounce time in ms
+bool lastButtonAState = HIGH;
+bool lastButtonBState = HIGH;
+bool lastButtonCState = HIGH;
+
+void setup() {
+  Serial.begin(9600); // Serial for RPM feedback
+
+  // Initialize OLED display
+  //if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) { // Address 0x3C for 128x64
+  //  Serial.println(F("SSD1306 allocation failed"));
+  //  for (;;); // Don't proceed, loop forever
+  //}
+  //display.clearDisplay();
+  //display.setTextSize(2); // Set text size for splash
+  //display.setTextColor(SSD1306_WHITE); // White text
+  //display.setCursor(0, 0); // Start at top-left corner
+  //display.println(F("Fan Control"));
+  //display.display();
+  //delay(2000); // Show splash screen for 2 seconds
+
+  pinMode(OC1A_PIN, OUTPUT);
+  pinMode(TACH1_PIN, INPUT_PULLUP); // Tachometer input for Fan 1
+  pinMode(TACH2_PIN, INPUT_PULLUP); // Tachometer input for Fan 2
+  pinMode(BUTTON_A_PIN, INPUT_PULLUP); // Button A with pull-up
+  pinMode(BUTTON_B_PIN, INPUT_PULLUP); // Button B with pull-up
+  pinMode(BUTTON_C_PIN, INPUT_PULLUP); // Button C with pull-up
+  attachInterrupt(digitalPinToInterrupt(TACH1_PIN), countPulse1, FALLING); // Interrupt for Fan 1
+  attachInterrupt(digitalPinToInterrupt(TACH2_PIN), countPulse2, FALLING); // Interrupt for Fan 2
+
+  // Timer1 configuration for 25 kHz PWM
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+  TCCR1A |= (1 << COM1A1) | (1 << WGM11);
+  TCCR1B |= (1 << WGM13) | (1 << CS10); // Prescaler = 1
+  ICR1 = TCNT1_TOP;
+
+  setPwmDuty(0); // Initial duty cycle 0%
+  Serial.println("Arduino initialized: 25 kHz PWM ready");
+}
+
+void loop() {
+  // Handle Button A (Set to 0%)
+  bool buttonAState = digitalRead(BUTTON_A_PIN);
+  if (buttonAState != lastButtonAState) {
+    lastDebounceTimeA = millis();
+  }
+  if ((millis() - lastDebounceTimeA) > debounceDelay) {
+    if (buttonAState == LOW && lastButtonAState == HIGH) {
+      currentDuty = 0;
+      setPwmDuty(currentDuty);
+      Serial.print("Duty:");
+      Serial.print(currentDuty);
+      Serial.println("%");
+      Serial.print("Button A pressed");
+    }
+  }
+  lastButtonAState = buttonAState;
+
+  // Handle Button B (Decrease by 5% or to 0% if at 10%)
+  bool buttonBState = digitalRead(BUTTON_B_PIN);
+  if (buttonBState != lastButtonBState) {
+    lastDebounceTimeB = millis();
+  }
+  if ((millis() - lastDebounceTimeB) > debounceDelay) {
+    if (buttonBState == LOW && lastButtonBState == HIGH) {
+      if (currentDuty == 10) {
+        currentDuty = 0;
+        setPwmDuty(currentDuty);
+      } else if (currentDuty > 10) {
+        currentDuty -= 5;
+        setPwmDuty(currentDuty);
+      }
+      Serial.print("Duty:");
+      Serial.print(currentDuty);
+      Serial.println("%");
+      Serial.print("Button B pressed");
+    }
+  }
+  lastButtonBState = buttonBState;
+
+  // Handle Button C (Increase by 5% or to 10% if at 0%)
+  bool buttonCState = digitalRead(BUTTON_C_PIN);
+  if (buttonCState != lastButtonCState) {
+    lastDebounceTimeC = millis();
+  }
+  if ((millis() - lastDebounceTimeC) > debounceDelay) {
+    if (buttonCState == LOW && lastButtonCState == HIGH) {
+      if (currentDuty == 0) {
+        currentDuty = 10;
+        setPwmDuty(currentDuty);
+      } else if (currentDuty < 100) {
+        currentDuty += 5;
+        setPwmDuty(currentDuty);
+      }
+      Serial.print("Duty:");
+      Serial.print(currentDuty);
+      Serial.println("%");
+      Serial.print("Button C pressed");
+    }
+  }
+  lastButtonCState = buttonCState;
+
+  // Calculate and send RPM every second, update OLED
+  if (millis() - lastRpmTime >= 1000) {
+    noInterrupts();
+    unsigned long pulses1 = pulseCount1;
+    unsigned long pulses2 = pulseCount2;
+    pulseCount1 = 0;
+    pulseCount2 = 0;
+    interrupts();
+    unsigned int rpm1 = (pulses1 * 30); // 2 pulses per revolution, 60 seconds
+    unsigned int rpm2 = (pulses2 * 30); // 2 pulses per revolution, 60 seconds
+    Serial.print("RPM1:");
+    Serial.println(rpm1);
+    Serial.print("RPM2:");
+    Serial.println(rpm2);
+
+    // Update OLED display
+    //display.clearDisplay();
+    
+    // Yellow area (top 16 pixels) for RPM1 and RPM2, smaller font, centered
+    //display.setTextSize(1);
+    //display.setTextColor(SSD1306_WHITE); // White maps to yellow in top area
+    //char rpm1Text[16];
+    //snprintf(rpm1Text, sizeof(rpm1Text), "RPM1: %u", rpm1);
+    //int16_t x1, y1;
+    //uint16_t w, h;
+    //display.getTextBounds(rpm1Text, 0, 0, &x1, &y1, &w, &h);
+    //display.setCursor((SCREEN_WIDTH - w) / 2, 0); // Center horizontally, top
+    //display.println(rpm1Text);
+    
+    //char rpm2Text[16];
+    //snprintf(rpm2Text, sizeof(rpm2Text), "RPM2: %u", rpm2);
+    //display.getTextBounds(rpm2Text, 0, 0, &x1, &y1, &w, &h);
+    //display.setCursor((SCREEN_WIDTH - w) / 2, 8); // Center, below RPM1
+    //display.println(rpm2Text);
+    
+    // Blue area (below y=16) for Fan %, larger font, centered
+    //display.setTextSize(3);
+    //display.setTextColor(SSD1306_WHITE); // White maps to blue below top area
+    //char fanText[16];
+    //snprintf(fanText, sizeof(fanText), "Fan: %d%%", currentDuty);
+    //display.getTextBounds(fanText, 0, 0, &x1, &y1, &w, &h);
+    //display.setCursor((SCREEN_WIDTH - w) / 2, 16); // Center horizontally
+    //display.println(fanText);
+    
+    //display.display();
+
+    lastRpmTime = millis();
+  }
+}
+
+void setPwmDuty(byte duty) {
+  OCR1A = (word) (duty * TCNT1_TOP) / 100;
+}
+
+void countPulse1() {
+  pulseCount1++;
+}
+
+void countPulse2() {
+  pulseCount2++;
+}
